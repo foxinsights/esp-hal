@@ -194,6 +194,84 @@ bitflags::bitflags! {
     }
 }
 
+/// Get the time since the last power-on reset in the raw register units.
+#[cfg(lp_timer_driver_supported)]
+pub(crate) fn time_since_boot_raw() -> u64 {
+    let rtc_cntl = LP_TIMER::regs();
+
+    cfg_if::cfg_if! {
+        if #[cfg(esp32)] {
+            rtc_cntl.time_update().write(|w| w.time_update().set_bit());
+            while rtc_cntl.time_update().read().time_valid().bit_is_clear() {
+                // Might take 1 RTC slowclk period, don't flood RTC bus
+                crate::rom::ets_delay_us(1);
+            }
+
+            let h = rtc_cntl.time1().read().time_hi().bits();
+            let l = rtc_cntl.time0().read().time_lo().bits();
+        } else if #[cfg(any(esp32c6, esp32h2))] {
+            rtc_cntl.update().write(|w| w.main_timer_update().set_bit());
+
+            let h = rtc_cntl
+                .main_buf0_high()
+                .read()
+                .main_timer_buf0_high()
+                .bits();
+            let l = rtc_cntl.main_buf0_low().read().main_timer_buf0_low().bits();
+        } else {
+            rtc_cntl.time_update().write(|w| w.time_update().set_bit());
+
+            let h = rtc_cntl.time_high0().read().timer_value0_high().bits();
+            let l = rtc_cntl.time_low0().read().timer_value0_low().bits();
+        }
+    }
+
+    ((h as u64) << 32) | (l as u64)
+}
+
+/// Read the current value of the boot time registers in microseconds.
+#[cfg(lp_timer_driver_supported)]
+pub(crate) fn boot_time_us() -> u64 {
+    // For more info on about how RTC setting works and what it has to do with boot time, see https://github.com/esp-rs/esp-hal/pull/1883
+
+    // In terms of registers, STORE2 and STORE3 are used on all current chips
+    // (esp32, esp32p4, esp32h2, esp32c2, esp32c3, esp32c5, esp32c6, esp32c61,
+    // esp32s2, esp32s3)
+
+    // In terms of peripherals:
+
+    // - LPWR is used on the following chips: esp32, esp32p4, esp32c2, esp32c3, esp32s2, esp32s3
+
+    // - LP_AON is used on the following chips: esp32c5, esp32c6, esp32c61, esp32h2
+
+    // For registers and peripherals used in esp-idf, see https://github.com/search?q=repo%3Aespressif%2Fesp-idf+RTC_BOOT_TIME_LOW_REG+RTC_BOOT_TIME_HIGH_REG+path%3A**%2Frtc.h&type=code
+
+    let rtc_cntl = LP_AON::regs();
+
+    let l = rtc_cntl.store2().read().bits() as u64;
+    let h = rtc_cntl.store3().read().bits() as u64;
+
+    // https://github.com/espressif/esp-idf/blob/23e4823f17a8349b5e03536ff7653e3e584c9351/components/newlib/port/esp_time_impl.c#L115
+    l + (h << 32)
+}
+
+/// Set the current value of the boot time registers in microseconds.
+#[cfg(lp_timer_driver_supported)]
+pub(crate) fn set_boot_time_us(boot_time_us: u64) {
+    // Please see `boot_time_us` for documentation on registers and peripherals
+    // used for certain SOCs.
+
+    let rtc_cntl = LP_AON::regs();
+
+    // https://github.com/espressif/esp-idf/blob/23e4823/components/newlib/port/esp_time_impl.c#L102-L103
+    rtc_cntl
+        .store2() // Low bits
+        .write(|w| unsafe { w.bits((boot_time_us & 0xffff_ffff) as u32) });
+    rtc_cntl
+        .store3() // High bits
+        .write(|w| unsafe { w.bits((boot_time_us >> 32) as u32) });
+}
+
 /// Low-power Management
 pub struct Rtc<'d> {
     _inner: LPWR<'d>,
@@ -220,36 +298,7 @@ impl<'d> Rtc<'d> {
     /// Get the time since boot in the raw register units.
     #[cfg(lp_timer_driver_supported)]
     fn time_since_boot_raw(&self) -> u64 {
-        let rtc_cntl = LP_TIMER::regs();
-
-        cfg_if::cfg_if! {
-            if #[cfg(esp32)] {
-                rtc_cntl.time_update().write(|w| w.time_update().set_bit());
-                while rtc_cntl.time_update().read().time_valid().bit_is_clear() {
-                    // Might take 1 RTC slowclk period, don't flood RTC bus
-                    crate::rom::ets_delay_us(1);
-                }
-
-                let h = rtc_cntl.time1().read().time_hi().bits();
-                let l = rtc_cntl.time0().read().time_lo().bits();
-            } else if #[cfg(any(esp32c6, esp32h2))] {
-                rtc_cntl.update().write(|w| w.main_timer_update().set_bit());
-
-                let h = rtc_cntl
-                    .main_buf0_high()
-                    .read()
-                    .main_timer_buf0_high()
-                    .bits();
-                let l = rtc_cntl.main_buf0_low().read().main_timer_buf0_low().bits();
-            } else {
-                rtc_cntl.time_update().write(|w| w.time_update().set_bit());
-
-                let h = rtc_cntl.time_high0().read().timer_value0_high().bits();
-                let l = rtc_cntl.time_low0().read().timer_value0_low().bits();
-            }
-        }
-
-        ((h as u64) << 32) | (l as u64)
+        time_since_boot_raw()
     }
 
     /// Get the time elapsed since the last power-on reset.
@@ -259,49 +308,6 @@ impl<'d> Rtc<'d> {
     #[cfg(lp_timer_driver_supported)]
     pub fn time_since_power_up(&self) -> Duration {
         Duration::from_micros(crate::clock::rtc_ticks_to_us(self.time_since_boot_raw()))
-    }
-
-    /// Read the current value of the boot time registers in microseconds.
-    #[cfg(lp_timer_driver_supported)]
-    fn boot_time_us(&self) -> u64 {
-        // For more info on about how RTC setting works and what it has to do with boot time, see https://github.com/esp-rs/esp-hal/pull/1883
-
-        // In terms of registers, STORE2 and STORE3 are used on all current chips
-        // (esp32, esp32p4, esp32h2, esp32c2, esp32c3, esp32c5, esp32c6, esp32c61,
-        // esp32s2, esp32s3)
-
-        // In terms of peripherals:
-
-        // - LPWR is used on the following chips: esp32, esp32p4, esp32c2, esp32c3, esp32s2, esp32s3
-
-        // - LP_AON is used on the following chips: esp32c5, esp32c6, esp32c61, esp32h2
-
-        // For registers and peripherals used in esp-idf, see https://github.com/search?q=repo%3Aespressif%2Fesp-idf+RTC_BOOT_TIME_LOW_REG+RTC_BOOT_TIME_HIGH_REG+path%3A**%2Frtc.h&type=code
-
-        let rtc_cntl = LP_AON::regs();
-
-        let l = rtc_cntl.store2().read().bits() as u64;
-        let h = rtc_cntl.store3().read().bits() as u64;
-
-        // https://github.com/espressif/esp-idf/blob/23e4823f17a8349b5e03536ff7653e3e584c9351/components/newlib/port/esp_time_impl.c#L115
-        l + (h << 32)
-    }
-
-    /// Set the current value of the boot time registers in microseconds.
-    #[cfg(lp_timer_driver_supported)]
-    fn set_boot_time_us(&self, boot_time_us: u64) {
-        // Please see `boot_time_us` for documentation on registers and peripherals
-        // used for certain SOCs.
-
-        let rtc_cntl = LP_AON::regs();
-
-        // https://github.com/espressif/esp-idf/blob/23e4823/components/newlib/port/esp_time_impl.c#L102-L103
-        rtc_cntl
-            .store2() // Low bits
-            .write(|w| unsafe { w.bits((boot_time_us & 0xffff_ffff) as u32) });
-        rtc_cntl
-            .store3() // High bits
-            .write(|w| unsafe { w.bits((boot_time_us >> 32) as u32) });
     }
 
     #[procmacros::doc_replace]
@@ -333,7 +339,7 @@ impl<'d> Rtc<'d> {
         // Current time is boot time + time since boot
 
         let rtc_time_us = self.time_since_power_up().as_micros();
-        let boot_time_us = self.boot_time_us();
+        let boot_time_us = boot_time_us();
         let wrapped_boot_time_us = u64::MAX - boot_time_us;
 
         // We can detect if we wrapped the boot time by checking if rtc time is greater
@@ -360,9 +366,9 @@ impl<'d> Rtc<'d> {
             // Subtracting time since boot and adding current new time is equivalent and
             // avoids overflow. We just checked that rtc_time_us is less than time_us
             // so this won't overflow.
-            self.set_boot_time_us(u64::MAX - rtc_time_us + current_time_us)
+            set_boot_time_us(u64::MAX - rtc_time_us + current_time_us)
         } else {
-            self.set_boot_time_us(current_time_us - rtc_time_us)
+            set_boot_time_us(current_time_us - rtc_time_us)
         }
     }
 

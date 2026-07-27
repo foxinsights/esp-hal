@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Rtc::current_time_us` no longer jumps when the RTC slow clock calibration value changes, which happens on every boot. The boot time is now re-based with the previous value, so a new value only applies to the ticks counted after it was stored.
+
 
 ### Removed
 

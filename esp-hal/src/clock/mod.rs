@@ -513,6 +513,32 @@ impl Clocks {
             }
         }
 
+        // The LP timer counts from the last power-on reset and `Rtc::current_time_us` scales that
+        // whole counter with the calibration value stored below. Storing a new value therefore
+        // re-scales all of the already elapsed time retroactively, so the current time jumps by
+        // `time_since_power_up * (new_cal - old_cal) / old_cal` -- an error proportional to the
+        // uptime rather than to the time since the value last changed. Since this runs on every
+        // boot, and RTC_SLOW_CLK is usually an RC oscillator whose measured period varies with
+        // temperature, a device that boots regularly (e.g. to wake from deep sleep) accumulates
+        // minutes to hours of error over its uptime.
+        //
+        // Re-base the boot time with the old value before storing the new one so that the current
+        // time stays continuous and the new value only applies to ticks counted from here on, the
+        // way esp-idf's `esp_clk_slowclk_cal_set` does.
+        #[cfg(lp_timer_driver_supported)]
+        {
+            let old_cal = rtc_slow_cal_period();
+            // Zero means no value has been stored yet (first boot after a power-on reset), so
+            // there is no previous scale that needs correcting.
+            if old_cal != 0 {
+                let ticks = crate::rtc_cntl::time_since_boot_raw();
+                let boot_time_us = crate::rtc_cntl::boot_time_us()
+                    .wrapping_add(rtc_ticks_to_us_with_period(ticks, old_cal))
+                    .wrapping_sub(rtc_ticks_to_us_with_period(ticks, cal_val as u64));
+                crate::rtc_cntl::set_boot_time_us(boot_time_us);
+            }
+        }
+
         LP_AON::regs()
             .store1()
             .write(|w| unsafe { w.bits(cal_val) });
@@ -551,8 +577,15 @@ fn rtc_slow_cal_period() -> u64 {
 /// Convert RTC slow clock ticks to microseconds using the calibrated period.
 #[cfg(lp_timer_driver_supported)]
 pub(crate) fn rtc_ticks_to_us(ticks: u64) -> u64 {
-    let period = rtc_slow_cal_period();
+    rtc_ticks_to_us_with_period(ticks, rtc_slow_cal_period())
+}
 
+/// Convert RTC slow clock ticks to microseconds using an explicit period.
+///
+/// Same as [`rtc_ticks_to_us`], but for callers that need to convert against a period other than
+/// the one currently stored -- see [`Clocks::calibrate_rtc_slow_clock`].
+#[cfg(lp_timer_driver_supported)]
+fn rtc_ticks_to_us_with_period(ticks: u64, period: u64) -> u64 {
     // The LP timer is a 48-bit counter running from RTC_SLOW_CLK.
     // `period` is a fixed point number with 19 fractional bits, it may be a 24-bit value if
     // RTC_SLOW_CLK is as low as 32768 Hz. Just multiplying the two may cause an overflow on 64
