@@ -1401,25 +1401,58 @@ unsafe extern "C" fn ble_hs_hci_rx_evt(cmd: *const u8, arg: *const c_void) -> i3
 unsafe extern "C" fn ble_hs_rx_data(om: *const OsMbuf, arg: *const c_void) -> i32 {
     trace!("ble_hs_rx_data {:?} {:?}", om, arg);
 
-    let data_ptr = unsafe { (*om).om_data };
-    let len = unsafe { (*om).om_len };
-    let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, len as usize) };
+    // An ACL packet larger than one controller ACL buffer arrives as a chain of mbufs.
+    let mut len = 0usize;
+    let mut segment = om;
+    while !segment.is_null() {
+        len += unsafe { (*segment).om_len } as usize;
+        segment = unsafe { (*segment).next };
+    }
 
-    super::BT_STATE.with(|state| {
-        let mut data = [0u8; 256];
+    // Drop packet if allocation fails.
+    let mut data = Vec::new();
+    if data.try_reserve_exact(len + 1).is_err() {
+        warn!(
+            "ble_hs_rx_data out of memory, dropping acl packet len={}",
+            len
+        );
+        unsafe {
+            r_os_mbuf_free_chain(om as *mut _);
+        }
+        return 0;
+    }
 
-        data[0] = 0x02; // ACL
-        data[1..][..data_slice.len()].copy_from_slice(data_slice);
-
-        state.rx_queue.push_back(ReceivedPacket {
-            data: Box::from(&data[..data_slice.len() + 1]),
-        });
-
-        super::dump_packet_info(&data[..(len + 1) as usize]);
-    });
+    data.push(0x02); // ACL
+    let mut segment = om;
+    while !segment.is_null() {
+        let segment_data =
+            unsafe { core::slice::from_raw_parts((*segment).om_data, (*segment).om_len as usize) };
+        data.extend_from_slice(segment_data);
+        segment = unsafe { (*segment).next };
+    }
 
     unsafe {
         r_os_mbuf_free_chain(om as *mut _);
+    }
+
+    super::dump_packet_info(&data);
+
+    let queued = super::BT_STATE.with(|state| {
+        if state.rx_queue.try_reserve(1).is_err() {
+            return false;
+        }
+        state.rx_queue.push_back(ReceivedPacket {
+            data: data.into_boxed_slice(),
+        });
+        true
+    });
+
+    if !queued {
+        warn!(
+            "ble_hs_rx_data out of memory, dropping acl packet len={}",
+            len
+        );
+        return 0;
     }
 
     crate::ble::controller::hci_read_data_available();
