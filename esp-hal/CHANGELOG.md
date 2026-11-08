@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `efuse::override_bluetooth_mac_address` sets the address returned for `InterfaceMacAddress::Bluetooth`.
 
 ### Changed
 

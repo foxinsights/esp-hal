@@ -35,6 +35,8 @@
 use core::{cmp, mem, slice, sync::atomic::Ordering};
 
 use bytemuck::AnyBitPattern;
+#[cfg(soc_has_bt)]
+use portable_atomic::AtomicU32;
 use portable_atomic::AtomicU8;
 
 #[cfg_attr(esp32, path = "esp32/mod.rs")]
@@ -268,6 +270,10 @@ pub fn interface_mac_address(kind: InterfaceMacAddress) -> MacAddress {
         }
         #[cfg(soc_has_bt)]
         InterfaceMacAddress::Bluetooth => {
+            if let Some(bluetooth) = bluetooth_mac_override() {
+                return bluetooth;
+            }
+
             derive_local_mac(&mut mac);
 
             mac.0[5] = mac.0[5].wrapping_add(1);
@@ -435,6 +441,40 @@ impl core::fmt::Display for SetMacError {
 }
 
 impl core::error::Error for SetMacError {}
+
+// The Bluetooth address set by `override_bluetooth_mac_address`: the first four bytes, then the
+// last two with bit 16 as the "set" flag.
+#[cfg(soc_has_bt)]
+static BLUETOOTH_MAC_LOW: AtomicU32 = AtomicU32::new(0);
+#[cfg(soc_has_bt)]
+static BLUETOOTH_MAC_HIGH: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the address [`interface_mac_address`] returns for
+/// [`InterfaceMacAddress::Bluetooth`], which the Bluetooth controller reads as its public device
+/// address. It replaces the derivation from the base MAC, so a firmware that must keep the address
+/// another stack gave the same chip can state it. Call it before the controller is initialized.
+#[cfg(soc_has_bt)]
+#[instability::unstable]
+pub fn override_bluetooth_mac_address(mac: MacAddress) {
+    let b = mac.as_bytes();
+    let low = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let high = u32::from_le_bytes([b[4], b[5], 0, 0]) | 1 << 16;
+    BLUETOOTH_MAC_LOW.store(low, Ordering::Relaxed);
+    BLUETOOTH_MAC_HIGH.store(high, Ordering::Release);
+}
+
+#[cfg(soc_has_bt)]
+fn bluetooth_mac_override() -> Option<MacAddress> {
+    let high = BLUETOOTH_MAC_HIGH.load(Ordering::Acquire);
+    if high & 1 << 16 == 0 {
+        return None;
+    }
+    let low = BLUETOOTH_MAC_LOW.load(Ordering::Relaxed).to_le_bytes();
+    let high = high.to_le_bytes();
+    Some(MacAddress::new_eui48([
+        low[0], low[1], low[2], low[3], high[0], high[1],
+    ]))
+}
 
 /// Helper function.
 /// Serves to derive a local MAC by adjusting the first octet of the given base MAC.
