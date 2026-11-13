@@ -550,7 +550,9 @@ fn enable_uart_mem_clk_impl(_clocks: &mut ClockTree, en: bool) {
     // Enabling clock should probably not reset the peripheral.
     let regs = SYSTEM::regs();
 
-    if en {
+    // The reset clears the FIFO RAM every UART shares: skip it when the bootloader left the clock
+    // running, or the first `Uart::new` drops what the ROM console (UART0) still has queued.
+    if en && !regs.perip_clk_en0().read().uart_mem_clk_en().bit() {
         regs.perip_rst_en0()
             .modify(|_, w| w.uart_mem_rst().bit(true));
         regs.perip_rst_en0()
