@@ -210,11 +210,14 @@ unsafe extern "C" fn rand() -> i32 {
     unsafe { crate::common_adapter::random() as i32 }
 }
 
+// The ESP32 adapter has its own sleep callbacks (`os_adapter_esp32.rs`).
+#[cfg(not(esp32))]
 #[ram]
 unsafe extern "C" fn btdm_lpcycles_2_hus(_cycles: u32, _error_corr: u32) -> u32 {
     todo!();
 }
 
+#[cfg(not(esp32))]
 #[ram]
 unsafe extern "C" fn btdm_hus_2_lpcycles(us: u32) -> u32 {
     const RTC_CLK_CAL_FRACT: u32 = 19;
@@ -228,26 +231,32 @@ unsafe extern "C" fn btdm_hus_2_lpcycles(us: u32) -> u32 {
     cycles as u32
 }
 
+#[cfg(not(esp32))]
 unsafe extern "C" fn btdm_sleep_check_duration(_slot_cnt: i32) -> i32 {
     todo!();
 }
 
+#[cfg(not(esp32))]
 unsafe extern "C" fn btdm_sleep_enter_phase1(_lpcycles: i32) {
     todo!();
 }
 
+#[cfg(not(esp32))]
 unsafe extern "C" fn btdm_sleep_enter_phase2() {
     todo!();
 }
 
+#[cfg(not(esp32))]
 unsafe extern "C" fn btdm_sleep_exit_phase1() {
     todo!();
 }
 
+#[cfg(not(esp32))]
 unsafe extern "C" fn btdm_sleep_exit_phase2() {
     todo!();
 }
 
+#[cfg(not(esp32))]
 unsafe extern "C" fn btdm_sleep_exit_phase3() {
     todo!();
 }
@@ -332,6 +341,9 @@ pub(crate) fn ble_init(config: &Config) -> PhyInitGuard<'static> {
 
         ble_os_adapter_chip_specific::bt_periph_module_enable();
 
+        #[cfg(esp32)]
+        ble_os_adapter_chip_specific::low_power_mode_init();
+        #[cfg(not(esp32))]
         ble_os_adapter_chip_specific::disable_sleep_mode();
 
         #[cfg(any(esp32c3, esp32s3))]
@@ -354,11 +366,11 @@ pub(crate) fn ble_init(config: &Config) -> PhyInitGuard<'static> {
 
         cfg_if::cfg_if! {
             if #[cfg(esp32)] {
-                unsafe extern "C" {
-                    fn btdm_rf_bb_init_phase2();
-                }
+                // No-op unless the `ble_modem_sleep` config option is enabled.
+                ble_os_adapter_chip_specific::modem_sleep_enable();
 
-                btdm_rf_bb_init_phase2();
+                // btdm_rf_bb_init_phase2
+                ble_os_adapter_chip_specific::init_bb();
                 coex_bt_high_prio();
             } else {
                 coex_pti_v2();
@@ -387,9 +399,16 @@ pub(crate) fn ble_deinit() {
         fn btdm_controller_deinit();
     }
 
+    // Wake a sleeping controller (and its PHY) up first; no-op without modem sleep.
+    #[cfg(esp32)]
+    ble_os_adapter_chip_specific::modem_sleep_disable();
+
     unsafe {
         btdm_controller_deinit();
     }
+
+    #[cfg(esp32)]
+    ble_os_adapter_chip_specific::low_power_mode_deinit();
     // Disabling the PHY happens automatically, when the BLEController gets dropped.
 }
 /// Sends HCI data to the BLE controller.
@@ -412,17 +431,22 @@ pub fn send_hci(data: &[u8]) {
 
                 PACKET_SENT.store(false, Ordering::Relaxed);
 
-                #[cfg(all(esp32, feature = "coex"))]
+                #[cfg(all(esp32, feature = "coex", not(ble_modem_sleep)))]
                 ble_os_adapter_chip_specific::async_wakeup_request(
                     ble_os_adapter_chip_specific::BTDM_ASYNC_WAKEUP_REQ_HCI,
                 );
+                // A sleeping controller only picks the packet up at its next wakeup otherwise.
+                #[cfg(all(esp32, ble_modem_sleep))]
+                ble_os_adapter_chip_specific::vhci_wakeup_request();
 
                 API_vhci_host_send_packet(packet.as_ptr(), packet.len() as u16);
 
-                #[cfg(all(esp32, feature = "coex"))]
+                #[cfg(all(esp32, feature = "coex", not(ble_modem_sleep)))]
                 ble_os_adapter_chip_specific::async_wakeup_request_end(
                     ble_os_adapter_chip_specific::BTDM_ASYNC_WAKEUP_REQ_HCI,
                 );
+                #[cfg(all(esp32, ble_modem_sleep))]
+                ble_os_adapter_chip_specific::vhci_wakeup_request_end();
 
                 trace!("sent vhci host packet");
 

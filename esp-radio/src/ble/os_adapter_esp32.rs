@@ -67,10 +67,12 @@ pub(super) struct osi_funcs_s {
     read_efuse_mac: Option<unsafe extern "C" fn(*const ()) -> i32>,
     srand: Option<unsafe extern "C" fn(u32)>,
     rand: Option<unsafe extern "C" fn() -> i32>,
-    btdm_lpcycles_2_hus: Option<unsafe extern "C" fn(u32, u32) -> u32>,
-    btdm_hus_2_lpcycles: Option<unsafe extern "C" fn(u32) -> u32>,
-    btdm_sleep_check_duration: Option<unsafe extern "C" fn(i32) -> i32>,
-    btdm_sleep_enter_phase1: Option<unsafe extern "C" fn(i32)>,
+    // Signatures as in ESP-IDF's `components/bt/controller/esp32/bt.c` (`struct osi_funcs_t`) of
+    // the release that ships the linked `libbtdm_app.a` (compile version 045a658).
+    btdm_lpcycles_2_us: Option<unsafe extern "C" fn(u32) -> u32>,
+    btdm_us_2_lpcycles: Option<unsafe extern "C" fn(u32) -> u32>,
+    btdm_sleep_check_duration: Option<unsafe extern "C" fn(*mut u32) -> bool>,
+    btdm_sleep_enter_phase1: Option<unsafe extern "C" fn(u32)>,
     btdm_sleep_enter_phase2: Option<unsafe extern "C" fn()>,
     btdm_sleep_exit_phase1: Option<unsafe extern "C" fn()>,
     btdm_sleep_exit_phase2: Option<unsafe extern "C" fn()>,
@@ -134,13 +136,15 @@ pub(super) static G_OSI_FUNCS: osi_funcs_s = osi_funcs_s {
     read_efuse_mac: Some(read_efuse_mac),
     srand: Some(crate::ble::btdm::srand),
     rand: Some(crate::ble::btdm::rand),
-    btdm_lpcycles_2_hus: Some(btdm_lpcycles_2_hus),
-    btdm_hus_2_lpcycles: Some(btdm_hus_2_lpcycles),
+    // The sleep callbacks are only called by the controller in modem sleep mode, i.e. with the
+    // `ble_modem_sleep` config option; ESP-IDF leaves the two `exit_phase1/2` slots NULL.
+    btdm_lpcycles_2_us: Some(btdm_lpcycles_2_us),
+    btdm_us_2_lpcycles: Some(btdm_us_2_lpcycles),
     btdm_sleep_check_duration: Some(btdm_sleep_check_duration),
     btdm_sleep_enter_phase1: Some(btdm_sleep_enter_phase1),
     btdm_sleep_enter_phase2: Some(btdm_sleep_enter_phase2),
-    btdm_sleep_exit_phase1: Some(btdm_sleep_exit_phase1),
-    btdm_sleep_exit_phase2: Some(btdm_sleep_exit_phase2),
+    btdm_sleep_exit_phase1: None,
+    btdm_sleep_exit_phase2: None,
     btdm_sleep_exit_phase3: Some(btdm_sleep_exit_phase3),
     coex_bt_wakeup_request: Some(coex_bt_wakeup_request),
     coex_bt_wakeup_request_end: Some(coex_bt_wakeup_request_end),
@@ -452,20 +456,287 @@ pub(crate) fn bt_periph_module_enable() {
     // nothing
 }
 
-pub(crate) fn disable_sleep_mode() {
-    unsafe extern "C" {
-        fn btdm_controller_set_sleep_mode(mode: u8);
+// Modem sleep, ported from ESP-IDF `components/bt/controller/esp32/bt.c` at the commit that
+// introduced the linked `libbtdm_app.a` (esp32-bt-lib 045a658b, esp-idf 44b05258d7), built the way
+// fw-fox2 configures it: `CONFIG_BTDM_CTRL_MODEM_SLEEP_MODE_ORIG`,
+// `CONFIG_BTDM_CTRL_LPCLK_SEL_MAIN_XTAL`, no `CONFIG_PM_ENABLE` (so no PM locks, no sleep timer).
+
+unsafe extern "C" {
+    fn btdm_controller_set_sleep_mode(mode: u8);
+    fn btdm_controller_get_sleep_mode() -> u8;
+    fn btdm_rf_bb_init_phase2();
+}
+
+#[cfg(ble_modem_sleep)]
+unsafe extern "C" {
+    fn btdm_controller_enable_sleep(enable: bool);
+    fn btdm_power_state_active() -> bool;
+    fn btdm_wakeup_request();
+    fn btdm_in_wakeup_requesting_set(in_wakeup_requesting: bool);
+    fn btdm_lpclk_select_src(sel: u32) -> bool;
+    fn btdm_lpclk_set_div(div: u32) -> bool;
+    fn btdm_dispatch_work_to_controller(
+        callback: unsafe extern "C" fn(*mut c_void),
+        arg: *mut c_void,
+        blocking: bool,
+    ) -> i32;
+    fn sdk_config_set_bt_pll_track_enable(enable: bool);
+}
+
+const BTDM_MODEM_SLEEP_MODE_NONE: u8 = 0;
+const BTDM_MODEM_SLEEP_MODE_ORIG: u8 = 1;
+
+#[cfg(ble_modem_sleep)]
+const BTDM_LPCLK_SEL_XTAL: u32 = 0;
+
+/// Sleep durations shorter than this many slots are not worth the PHY/RF power cycle.
+const BTDM_MIN_SLEEP_DURATION: u32 = 12;
+/// Slots it takes to wake the modem up, including re-enabling the PHY/RF.
+const BTDM_MODEM_WAKE_UP_DELAY: u32 = 4;
+
+/// `RTC_CLK_CAL_FRACT`: fractional bits of [BTDM_LPCYCLE_US].
+const BTDM_LPCYCLE_US_FRAC: u32 = 19;
+/// Low-power clock period in µs, fixed point with [BTDM_LPCYCLE_US_FRAC] fractional bits.
+///
+/// The main XTAL divided by `2 * f_xtal[MHz]` runs at 500 kHz whatever the XTAL frequency, so a
+/// cycle is 2 µs (ESP-IDF: `btdm_lpcycle_us = 2 << btdm_lpcycle_us_frac`).
+const BTDM_LPCYCLE_US: u32 = 2 << BTDM_LPCYCLE_US_FRAC;
+
+/// The PHY/RF is switched off by [btdm_sleep_enter_phase2] and not yet back on.
+static PHY_OFF_FOR_SLEEP: AtomicBool = AtomicBool::new(false);
+/// [esp_phy::rf_on_count] when the BT baseband RF was last initialized
+/// (`btdm_rf_bb_init_phase2`); ESP-IDF's `s_time_phy_rf_just_enabled`.
+static BB_INIT_RF_ON_COUNT: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+#[cfg(ble_modem_sleep)]
+static WAKEUP_REQ_SEM: portable_atomic::AtomicPtr<c_void> =
+    portable_atomic::AtomicPtr::new(core::ptr::null_mut());
+
+#[ram]
+unsafe extern "C" fn btdm_lpcycles_2_us(cycles: u32) -> u32 {
+    // The number of lp cycles should not lead to overflow. Thrs: 100s
+    let us = BTDM_LPCYCLE_US as u64 * cycles as u64;
+    ((us + (1 << (BTDM_LPCYCLE_US_FRAC - 1))) >> BTDM_LPCYCLE_US_FRAC) as u32
+}
+
+/// Converts a duration in µs into a number of low-power clock cycles.
+#[ram]
+unsafe extern "C" fn btdm_us_2_lpcycles(us: u32) -> u32 {
+    (((us as u64) << BTDM_LPCYCLE_US_FRAC) / BTDM_LPCYCLE_US as u64) as u32
+}
+
+#[ram]
+unsafe extern "C" fn btdm_sleep_check_duration(slot_cnt: *mut u32) -> bool {
+    unsafe {
+        if *slot_cnt < BTDM_MIN_SLEEP_DURATION {
+            return false;
+        }
+        // wake up in advance considering the delay in enabling PHY/RF
+        *slot_cnt -= BTDM_MODEM_WAKE_UP_DELAY;
+    }
+    true
+}
+
+unsafe extern "C" fn btdm_sleep_enter_phase1(_lpcycles: u32) {
+    // ESP-IDF only arms a light-sleep wakeup timer here (CONFIG_PM_ENABLE).
+}
+
+unsafe extern "C" fn btdm_sleep_enter_phase2() {
+    if unsafe { btdm_controller_get_sleep_mode() } == BTDM_MODEM_SLEEP_MODE_ORIG {
+        trace!("btdm_sleep_enter_phase2");
+        // Idempotent so the PHY ref count can't drift should the controller not pair the calls.
+        if !PHY_OFF_FOR_SLEEP.swap(true, Ordering::AcqRel) {
+            esp_phy::disable_phy();
+        }
+    }
+}
+
+unsafe extern "C" fn btdm_sleep_exit_phase3() {
+    if unsafe { btdm_controller_get_sleep_mode() } == BTDM_MODEM_SLEEP_MODE_ORIG {
+        trace!("btdm_sleep_exit_phase3");
+        phy_on_after_sleep();
+        check_and_init_bb();
+    }
+}
+
+/// Switch the PHY back on if [btdm_sleep_enter_phase2] switched it off.
+fn phy_on_after_sleep() {
+    if PHY_OFF_FOR_SLEEP.swap(false, Ordering::AcqRel) {
+        // Balanced by `disable_phy` in `btdm_sleep_enter_phase2` or by the BLE connector's guard.
+        core::mem::forget(esp_phy::enable_phy());
+    }
+}
+
+/// Re-initialize the BT baseband RF if the PHY/RF was switched off since the last init
+/// (ESP-IDF `btdm_check_and_init_bb`).
+fn check_and_init_bb() {
+    let rf_on_count = esp_phy::rf_on_count();
+    if BB_INIT_RF_ON_COUNT.swap(rf_on_count, Ordering::AcqRel) != rf_on_count {
+        unsafe { btdm_rf_bb_init_phase2() };
+    }
+}
+
+/// Initialize the BT baseband RF after the PHY was enabled in `ble_init`.
+pub(crate) fn init_bb() {
+    BB_INIT_RF_ON_COUNT.store(esp_phy::rf_on_count(), Ordering::Release);
+    unsafe { btdm_rf_bb_init_phase2() };
+}
+
+/// Select the low-power clock and the sleep mode; must run before `btdm_controller_init`
+/// (ESP-IDF `btdm_low_power_mode_init`).
+pub(crate) fn low_power_mode_init() {
+    cfg_if::cfg_if! {
+        if #[cfg(ble_modem_sleep)] {
+            debug!("BT modem sleep: using main XTAL as low-power clock");
+            let xtal_mhz = esp_hal::clock::xtal_clock().as_mhz();
+            let select_src_ret = unsafe { btdm_lpclk_select_src(BTDM_LPCLK_SEL_XTAL) };
+            let set_div_ret = unsafe { btdm_lpclk_set_div(xtal_mhz * 2 - 1) };
+            assert!(
+                select_src_ret && set_div_ret,
+                "selecting the BT low-power clock failed"
+            );
+
+            let sem = crate::compat::semaphore::sem_create(1, 0);
+            WAKEUP_REQ_SEM.store(sem, Ordering::Release);
+
+            unsafe { btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_ORIG) };
+        } else {
+            unsafe { btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_NONE) };
+        }
+    }
+}
+
+/// Undo [low_power_mode_init] after `btdm_controller_deinit`
+/// (ESP-IDF `btdm_low_power_mode_deinit` + `s_wakeup_req_sem` cleanup).
+pub(crate) fn low_power_mode_deinit() {
+    unsafe { btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_NONE) };
+
+    #[cfg(ble_modem_sleep)]
+    {
+        let sem = WAKEUP_REQ_SEM.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !sem.is_null() {
+            crate::compat::semaphore::sem_delete(sem);
+        }
+    }
+}
+
+/// Let the controller sleep; call after enabling the PHY and before `btdm_rf_bb_init_phase2` /
+/// `btdm_controller_enable` (the matching part of ESP-IDF `esp_bt_controller_enable`).
+pub(crate) fn modem_sleep_enable() {
+    #[cfg(ble_modem_sleep)]
+    unsafe {
+        if btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG {
+            btdm_controller_enable_sleep(true);
+        }
+        sdk_config_set_bt_pll_track_enable(true);
+    }
+}
+
+/// Stop modem sleep and wait until the controller is awake, so it can be torn down with the
+/// PHY on (the matching part of ESP-IDF `esp_bt_controller_disable`).
+pub(crate) fn modem_sleep_disable() {
+    #[cfg(ble_modem_sleep)]
+    unsafe {
+        if btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG {
+            btdm_controller_enable_sleep(false);
+            async_wakeup_request(BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA);
+            while !btdm_power_state_active() {
+                crate::hal::delay::Delay::new().delay_micros(1000);
+            }
+            async_wakeup_request_end(BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA);
+        }
     }
 
-    const BTDM_MODEM_SLEEP_MODE_NONE: u8 = 0;
+    // The BLE connector's PHY guard is dropped after this; make sure the PHY reference it
+    // accounts for is held again.
+    phy_on_after_sleep();
+}
 
-    unsafe {
-        btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_NONE);
+/// Wake the controller before handing it an HCI packet (ESP-IDF `esp_vhci_host_send_packet`).
+#[cfg(ble_modem_sleep)]
+pub(crate) fn vhci_wakeup_request() {
+    async_wakeup_request(BTDM_ASYNC_WAKEUP_REQ_HCI);
+}
+
+#[cfg(ble_modem_sleep)]
+pub(crate) fn vhci_wakeup_request_end() {
+    async_wakeup_request_end(BTDM_ASYNC_WAKEUP_REQ_HCI);
+}
+
+#[cfg(ble_modem_sleep)]
+const BTDM_ASYNC_WAKEUP_REQ_HCI: i32 = 0;
+#[cfg(ble_modem_sleep)]
+const BTDM_ASYNC_WAKEUP_REQ_COEX: i32 = 1;
+#[cfg(ble_modem_sleep)]
+const BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA: i32 = 2;
+
+/// Runs on the controller task (dispatched by [async_wakeup_request]).
+#[cfg(ble_modem_sleep)]
+unsafe extern "C" fn btdm_wakeup_request_callback(_arg: *mut c_void) {
+    unsafe { btdm_wakeup_request() };
+    let sem = WAKEUP_REQ_SEM.load(Ordering::Acquire);
+    crate::compat::semaphore::sem_give(sem);
+}
+
+/// ESP-IDF `async_wakeup_request`; returns whether a wakeup was requested.
+#[cfg(ble_modem_sleep)]
+fn async_wakeup_request(event: i32) -> bool {
+    trace!("async_wakeup_request {}", event);
+    let mut do_wakeup_request = false;
+
+    match event {
+        BTDM_ASYNC_WAKEUP_REQ_HCI | BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA => unsafe {
+            btdm_in_wakeup_requesting_set(true);
+            if !btdm_power_state_active() {
+                do_wakeup_request = true;
+
+                let res = btdm_dispatch_work_to_controller(
+                    btdm_wakeup_request_callback,
+                    core::ptr::null_mut(),
+                    true,
+                );
+                if res == 0 {
+                    let sem = WAKEUP_REQ_SEM.load(Ordering::Acquire);
+                    crate::compat::semaphore::sem_take(sem, crate::compat::OSI_FUNCS_TIME_BLOCKING);
+                } else {
+                    warn!("btdm_dispatch_work_to_controller failed: {}", res);
+                }
+            }
+        },
+        BTDM_ASYNC_WAKEUP_REQ_COEX => unsafe {
+            if !btdm_power_state_active() {
+                do_wakeup_request = true;
+                btdm_wakeup_request();
+            }
+        },
+        _ => {}
+    }
+
+    do_wakeup_request
+}
+
+/// ESP-IDF `async_wakeup_request_end`.
+#[cfg(ble_modem_sleep)]
+fn async_wakeup_request_end(event: i32) {
+    trace!("async_wakeup_request_end {}", event);
+    if matches!(
+        event,
+        BTDM_ASYNC_WAKEUP_REQ_HCI | BTDM_ASYNC_WAKEUP_REQ_CTRL_DISA
+    ) {
+        unsafe { btdm_in_wakeup_requesting_set(false) };
     }
 }
 
 pub(crate) unsafe extern "C" fn coex_bt_wakeup_request() -> bool {
     trace!("coex_bt_wakeup_request");
+
+    // With modem sleep the controller may be asleep when coex needs it: do what ESP-IDF does.
+    // (Unlike the `coex`-feature `async_wakeup_request` below, ESP-IDF does not set
+    // `btdm_in_wakeup_requesting` for a coex wakeup - it would never be cleared again.)
+    #[cfg(ble_modem_sleep)]
+    {
+        async_wakeup_request(BTDM_ASYNC_WAKEUP_REQ_COEX)
+    }
 
     // This should really be
     // ```rust,norun
@@ -477,13 +748,16 @@ pub(crate) unsafe extern "C" fn coex_bt_wakeup_request() -> bool {
     //
     // But doing the right thing here keeps BT from working.
     // In a similar scenario this function isn't called in ESP-IDF.
+    #[cfg(not(ble_modem_sleep))]
     true
 }
 
 pub(crate) unsafe extern "C" fn coex_bt_wakeup_request_end() {
     trace!("coex_bt_wakeup_request_end");
 
-    // This should really be
+    // ESP-IDF's `async_wakeup_request_end(BTDM_ASYNC_WAKEUP_REQ_COEX)` does nothing.
+
+    // Without modem sleep this should really be
     // ```rust,norun
     // #[cfg(feature = "coex")]
     // async_wakeup_request_end(BTDM_ASYNC_WAKEUP_REQ_COEX);
@@ -572,10 +846,12 @@ pub(crate) unsafe extern "C" fn ints_on(mask: u32) {
     }
 }
 
-#[cfg(feature = "coex")]
+// Without modem sleep the controller never sleeps; these only flag the HCI send. With
+// `ble_modem_sleep` the ESP-IDF versions further up replace them.
+#[cfg(all(feature = "coex", not(ble_modem_sleep)))]
 pub(crate) const BTDM_ASYNC_WAKEUP_REQ_HCI: i32 = 0;
 
-#[cfg(feature = "coex")]
+#[cfg(all(feature = "coex", not(ble_modem_sleep)))]
 pub(crate) const BTDM_ASYNC_WAKEUP_REQ_COEX: i32 = 1;
 
 // const BTDM_ASYNC_WAKEUP_REQMAX: i32 = 2;
@@ -593,7 +869,7 @@ pub(crate) const BTDM_ASYNC_WAKEUP_REQ_COEX: i32 = 1;
 ///   true if request lock is needed, false otherwise
 ///
 /// *************************************************************************
-#[cfg(feature = "coex")]
+#[cfg(all(feature = "coex", not(ble_modem_sleep)))]
 pub(crate) fn async_wakeup_request(event: i32) -> bool {
     trace!("async_wakeup_request {}", event);
 
@@ -643,7 +919,7 @@ pub(crate) fn async_wakeup_request(event: i32) -> bool {
 ///   true if request lock is needed, false otherwise
 ///
 /// *************************************************************************
-#[cfg(feature = "coex")]
+#[cfg(all(feature = "coex", not(ble_modem_sleep)))]
 pub(crate) fn async_wakeup_request_end(event: i32) {
     trace!("async_wakeup_request_end {}", event);
 

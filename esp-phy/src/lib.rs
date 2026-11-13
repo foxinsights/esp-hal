@@ -149,6 +149,8 @@ struct PhyState {
     calibrated: bool,
     /// Last calibration result code.
     calibration_result: i32,
+    /// Number of times the PHY/RF was switched on (ref count 0 -> 1), wrapping.
+    rf_on_count: u32,
 
     #[cfg(phy_backed_up_digital_register_count_is_set)]
     /// Backup of the digital PHY registers.
@@ -174,6 +176,7 @@ impl PhyState {
             calibration_data: None,
             calibrated: false,
             calibration_result: 0,
+            rf_on_count: 0,
 
             #[cfg(phy_backed_up_digital_register_count_is_set)]
             phy_digital_register_backup: None,
@@ -298,6 +301,7 @@ impl PhyState {
                 self.calibrate();
                 self.calibrated = true;
             }
+            self.rf_on_count = self.rf_on_count.wrapping_add(1);
         }
         #[cfg(esp32)]
         if let Some(cb) = self.mac_time_update_cb {
@@ -410,6 +414,16 @@ pub fn disable_phy() {
     // Without this, PHY_CLOCK_REF_COUNTER (u8) leaks on every phy_enable/phy_disable
     // cycle from the WiFi blob C-callback interface, overflowing after ~9 TCP connects.
     decrease_phy_clock_ref_count_internal();
+}
+
+/// Number of times the PHY/RF has been switched on so far (wrapping).
+///
+/// A changed value means the PHY was powered down and re-initialized in between, so radio state
+/// that lives in the PHY/RF registers (e.g. the Bluetooth baseband RF setup) must be restored.
+/// This is the counterpart of ESP-IDF's `esp_phy_rf_get_on_ts()`.
+#[doc(hidden)]
+pub fn rf_on_count() -> u32 {
+    PHY_STATE.with(|phy_state| phy_state.rf_on_count)
 }
 
 /// Enable the PHY clock and acquire a [PhyClockGuard].

@@ -22,6 +22,14 @@ options:
     default:
       - value: false
 
+  - name: ble_modem_sleep
+    description: "Let the ESP32 Bluetooth controller enter modem sleep (ESP-IDF
+      `CONFIG_BTDM_CTRL_MODEM_SLEEP_MODE_ORIG` with the main XTAL as low-power clock): between
+      radio events the controller switches the PHY/RF off, which cuts the current drawn while
+      advertising or connected. Only implemented for the ESP32; ignored on all other chips."
+    default:
+      - value: false
+
   - name: event_channel_capacity
     description: "Capacity of the internal event channel"
     default:

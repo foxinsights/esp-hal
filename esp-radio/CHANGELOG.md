@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ESP_RADIO_CONFIG_BLE_MODEM_SLEEP` (default off) lets the ESP32 Bluetooth controller modem-sleep between radio events (ESP-IDF `BTDM_CTRL_MODEM_SLEEP_MODE_ORIG`, main XTAL low-power clock): the PHY/RF is switched off in between and the controller is woken before each HCI packet.
 
 ### Changed
 
+- ESP32: the BLE OSI sleep callbacks match ESP-IDF's `osi_funcs_t` for the linked controller library (`btdm_lpcycles_2_us(cycles)`, `btdm_sleep_check_duration(*slot_cnt)`, NULL `exit_phase1/2`).
 
 ### Fixed
 

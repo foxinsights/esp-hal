@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rf_on_count` (hidden) counts PHY/RF power-ups, for re-initializing radio state after the PHY was off (ESP-IDF `esp_phy_rf_get_on_ts`).
 
 ### Changed
 
